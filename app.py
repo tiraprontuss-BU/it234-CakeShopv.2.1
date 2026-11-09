@@ -1,146 +1,129 @@
+# =====================================================================
+#  เซิร์ฟเวอร์ฐานข้อมูล SQLite สำหรับเว็บ my-db-site (IT234)
+#  ใช้กับ PythonAnywhere: อยู่ในโฟลเดอร์เดียวกับ index.html (เช่น /home/<ชื่อผู้ใช้>/my-database)
+#  repo เดียวกันนี้ขึ้น GitHub Pages ได้ด้วย (GitHub Pages จะไม่รันไฟล์นี้ แค่เก็บไว้เฉย ๆ)
+#
+#  หน้าที่ของไฟล์นี้:
+#    - ส่งหน้าเว็บ (index.html) ให้คนที่เปิดเว็บ
+#    - ส่งไฟล์ฐานข้อมูลให้เบราว์เซอร์อ่าน (SELECT ทำในเบราว์เซอร์)
+#    - รับคำสั่ง INSERT / UPDATE / DELETE แล้วบันทึกลงไฟล์ database.db จริง
+# =====================================================================
+
 import os
+import re
 import sqlite3
+import threading
 
-from flask import Flask, abort, redirect, render_template, request
+from flask import Flask, Response, jsonify, request, send_from_directory
 
-app = Flask(__name__)
+BASE = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.path.join(BASE, "database.db")
 
-# ที่อยู่เต็มของไฟล์ฐานข้อมูล: อยู่โฟลเดอร์เดียวกับ app.py เสมอ
-# (ถ้าเขียนแค่ "cakeshop.db" แล้วเปิดเว็บจากโฟลเดอร์อื่น จะได้ฐานข้อมูลเปล่าไฟล์ใหม่)
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(BASE_DIR, "cakeshop.db")
-SCHEMA_PATH = os.path.join(BASE_DIR, "schema.sql")
+# อนุญาตเฉพาะคำสั่งที่เพิ่ม แก้ หรือลบข้อมูล
+# ห้ามคำสั่งที่เปลี่ยนโครงสร้าง (CREATE, DROP, ALTER ...) เพราะใครก็เปิดเว็บนี้ได้
+ALLOWED = re.compile(r"^\s*(INSERT|UPDATE|DELETE|REPLACE)\b", re.IGNORECASE)
+BLOCKED = re.compile(r"\b(ATTACH|DETACH|PRAGMA|VACUUM|load_extension)\b", re.IGNORECASE)
 
-
-def get_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    # SQLite ไม่ตรวจ FOREIGN KEY จนกว่าจะเปิดบรรทัดนี้ ต้องเปิดทุกครั้งที่เชื่อมต่อ
-    conn.execute("PRAGMA foreign_keys = ON")
-    return conn
+app = Flask(__name__, static_folder=None)
+lock = threading.Lock()
 
 
-# สร้างฐานข้อมูลจาก schema.sql ครั้งแรก (ถ้ายังไม่มีไฟล์ cakeshop.db)
-def init_db():
-    if os.path.exists(DB_PATH):
-        return
-    conn = get_db()
-    with open(SCHEMA_PATH, encoding="utf-8") as f:
-        conn.executescript(f.read())
-    conn.commit()
-    conn.close()
+def connect():
+    con = sqlite3.connect(DB_PATH, timeout=10)
+    con.execute("PRAGMA foreign_keys = ON")   # ให้ SQLite ตรวจ FOREIGN KEY ทุกครั้ง
+    return con
 
 
-init_db()
+def db_version():
+    st = os.stat(DB_PATH)
+    return "%d-%d" % (st.st_mtime_ns, st.st_size)
 
 
-# อ่านค่าจากฟอร์ม และตรวจก่อนบันทึก (อย่าเชื่อข้อมูลจากหน้าเว็บ 100%)
-def read_cake_form():
-    form = {
-        "name": request.form.get("name", "").strip(),
-        "price": request.form.get("price", "").strip(),
-        "image": request.form.get("image", "").strip(),
-        "stock": request.form.get("stock", "0").strip() or "0",
-        "category_id": request.form.get("category_id", "").strip(),
-    }
-    if not form["name"]:
-        return form, "กรุณากรอกชื่อเค้ก"
-    try:
-        form["price"] = float(form["price"])
-    except ValueError:
-        return form, "ราคาต้องเป็นตัวเลข"
-    if form["price"] < 0:
-        return form, "ราคาต้องไม่ติดลบ"
-    try:
-        form["stock"] = int(form["stock"])
-    except ValueError:
-        return form, "จำนวนคงเหลือต้องเป็นจำนวนเต็ม"
-    if form["stock"] < 0:
-        return form, "จำนวนคงเหลือต้องไม่ติดลบ"
-    form["category_id"] = int(form["category_id"]) if form["category_id"].isdigit() else None
-    form["image"] = form["image"] or None
-    return form, None
+def no_cache(resp):
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
 
 
-# หน้าเมนู (Read: SELECT + JOIN)
+# ---------- หน้าเว็บ ----------
 @app.route("/")
-def cakemenu():
-    conn = get_db()
-    cakes = conn.execute("""
-        SELECT cakes.*, categories.name AS category_name
-        FROM cakes
-        LEFT JOIN categories ON cakes.category_id = categories.id
-        ORDER BY cakes.id
-    """).fetchall()
-    conn.close()
-    return render_template("cakemenu.html", cakes=cakes)
+def home():
+    return no_cache(send_from_directory(BASE, "index.html"))
 
 
-# เพิ่มเมนู (Create: INSERT)
-@app.route("/append", methods=["GET", "POST"])
-def append():
-    conn = get_db()
-    categories = conn.execute("SELECT * FROM categories ORDER BY name").fetchall()
-    error, form = None, {}
-
-    if request.method == "POST":
-        form, error = read_cake_form()
-        if not error:
-            try:
-                conn.execute(
-                    "INSERT INTO cakes (name, price, image, stock, category_id) VALUES (?, ?, ?, ?, ?)",
-                    (form["name"], form["price"], form["image"], form["stock"], form["category_id"]),
-                )
-                conn.commit()
-                conn.close()
-                return redirect("/")
-            except sqlite3.IntegrityError as e:   # เช่น หมวดที่เลือกไม่มีอยู่จริง (FOREIGN KEY)
-                error = "บันทึกไม่ได้: " + str(e)
-
-    conn.close()
-    return render_template("append.html", categories=categories, form=form, error=error)
+@app.route("/site.json")
+def site_json():
+    if not os.path.exists(os.path.join(BASE, "site.json")):
+        return jsonify({}), 404
+    return no_cache(send_from_directory(BASE, "site.json"))
 
 
-# แก้ไขเมนู (Update: UPDATE ... WHERE id = ?)
-@app.route("/edit/<int:id>", methods=["GET", "POST"])
-def edit(id):
-    conn = get_db()
-    categories = conn.execute("SELECT * FROM categories ORDER BY name").fetchall()
-    cake = conn.execute("SELECT * FROM cakes WHERE id = ?", (id,)).fetchone()
-    if cake is None:
-        conn.close()
-        abort(404)
-    error = None
-
-    if request.method == "POST":
-        form, error = read_cake_form()
-        if not error:
-            try:
-                conn.execute(
-                    "UPDATE cakes SET name = ?, price = ?, image = ?, stock = ?, category_id = ? WHERE id = ?",
-                    (form["name"], form["price"], form["image"], form["stock"], form["category_id"], id),
-                )
-                conn.commit()
-                conn.close()
-                return redirect("/")
-            except sqlite3.IntegrityError as e:
-                error = "บันทึกไม่ได้: " + str(e)
-        cake = dict(form, id=id)   # แสดงค่าที่เพิ่งกรอกกลับไปในฟอร์ม
-
-    conn.close()
-    return render_template("edit.html", cake=cake, categories=categories, error=error)
+# ---------- API ----------
+@app.route("/api/info")
+def info():
+    return no_cache(jsonify({"mode": "server"}))
 
 
-# ลบเมนู (Delete: DELETE ... WHERE id = ?)
-# ใช้ POST เท่านั้น: กันการลบโดยไม่ตั้งใจจากการเปิดลิงก์
-@app.route("/delete/<int:id>", methods=["POST"])
-def delete(id):
-    conn = get_db()
-    conn.execute("DELETE FROM cakes WHERE id = ?", (id,))
-    conn.commit()
-    conn.close()
-    return redirect("/")
+@app.route("/api/version")
+def version():
+    return no_cache(jsonify({"version": db_version()}))
+
+
+@app.route("/api/db")
+def get_db():
+    # คัดลอกฐานข้อมูลทั้งไฟล์แบบปลอดภัย แล้วส่งให้เบราว์เซอร์อ่านด้วย SQL
+    with lock:
+        src = connect()
+        mem = sqlite3.connect(":memory:")
+        src.backup(mem)
+        src.close()
+        tmp = os.path.join(BASE, ".snapshot.db")
+        out = sqlite3.connect(tmp)
+        mem.backup(out)
+        out.close()
+        mem.close()
+        with open(tmp, "rb") as f:
+            data = f.read()
+        os.remove(tmp)
+        ver = db_version()
+    resp = Response(data, mimetype="application/x-sqlite3")
+    resp.headers["X-DB-Version"] = ver
+    return no_cache(resp)
+
+
+@app.route("/api/exec", methods=["POST"])
+def exec_sql():
+    body = request.get_json(silent=True) or {}
+    sql = str(body.get("sql", "")).strip()
+    params = body.get("params") or []
+
+    if not ALLOWED.match(sql):
+        return jsonify(ok=False, error="อนุญาตเฉพาะคำสั่ง INSERT, UPDATE, DELETE"), 400
+    if BLOCKED.search(sql):
+        return jsonify(ok=False, error="คำสั่งนี้ไม่อนุญาตบนเว็บที่ใช้งานจริง"), 400
+    if not isinstance(params, list) or len(params) > 200:
+        return jsonify(ok=False, error="ข้อมูลที่ส่งมาไม่ถูกต้อง"), 400
+    if len(sql) > 5000:
+        return jsonify(ok=False, error="คำสั่งยาวเกินไป"), 400
+
+    with lock:
+        con = connect()
+        try:
+            # ส่งค่าเป็น parameter (?) แยกจากคำสั่ง กัน SQL Injection
+            cur = con.execute(sql, params)
+            con.commit()
+            result = dict(ok=True, changes=cur.rowcount, lastrowid=cur.lastrowid)
+        except sqlite3.Error as e:          # เช่น UNIQUE, NOT NULL, FOREIGN KEY constraint failed
+            con.rollback()
+            return jsonify(ok=False, error=str(e)), 400
+        except Exception as e:
+            con.rollback()
+            return jsonify(ok=False, error=str(e)), 400
+        finally:
+            con.close()
+        result["version"] = db_version()
+    return no_cache(jsonify(result))
 
 
 if __name__ == "__main__":
+    # ทดลองรันในเครื่อง: python flask_app.py แล้วเปิด http://localhost:5000
     app.run(debug=True)
